@@ -3,6 +3,7 @@ package issue
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 const (
 	GetIssueByIndexToolName    = "get_issue_by_index"
 	ListRepoIssuesToolName     = "list_repo_issues"
+	ListRepoLabelsToolName     = "list_repo_labels"
 	CreateIssueToolName        = "create_issue"
 	CreateIssueCommentToolName = "create_issue_comment"
 	UpdateIssueToolName        = "update_issue"
@@ -51,6 +53,15 @@ var (
 		mcp.WithString("labels", mcp.Description("Labels (comma-separated)")),
 		mcp.WithNumber("page", mcp.Description(params.Page), mcp.DefaultNumber(1)),
 		mcp.WithNumber("limit", mcp.Description(params.Limit), mcp.DefaultNumber(20)),
+	)
+
+	ListRepoLabelsTool = mcp.NewTool(
+		ListRepoLabelsToolName,
+		mcp.WithDescription("List labels available in a repository, including the numeric IDs required by add_issue_labels. If next_page is nonzero, call this tool again with that page to enumerate the complete label set."),
+		mcp.WithString("owner", mcp.Required(), mcp.Description(params.Owner)),
+		mcp.WithString("repo", mcp.Required(), mcp.Description(params.Repo)),
+		mcp.WithNumber("page", mcp.Description(params.Page), mcp.DefaultNumber(1), mcp.Min(1), mcp.MultipleOf(1)),
+		mcp.WithNumber("limit", mcp.Description(params.Limit), mcp.DefaultNumber(50), mcp.Min(1), mcp.Max(100), mcp.MultipleOf(1)),
 	)
 
 	CreateIssueTool = mcp.NewTool(
@@ -89,7 +100,7 @@ var (
 		mcp.WithString("owner", mcp.Required(), mcp.Description(params.Owner)),
 		mcp.WithString("repo", mcp.Required(), mcp.Description(params.Repo)),
 		mcp.WithNumber("index", mcp.Required(), mcp.Description(params.IssueIndex)),
-		mcp.WithString("labels", mcp.Required(), mcp.Description("Labels to add (comma-separated)")),
+		mcp.WithString("labels", mcp.Required(), mcp.Description("Numeric label IDs to add (comma-separated). Discover IDs with list_repo_labels first.")),
 	)
 
 	IssueStateChangeTool = mcp.NewTool(
@@ -142,6 +153,7 @@ var (
 func RegisterTool(s *server.MCPServer) {
 	s.AddTool(GetIssueByIndexTool, GetIssueByIndexFn)
 	s.AddTool(ListRepoIssuesTool, ListRepoIssuesFn)
+	s.AddTool(ListRepoLabelsTool, ListRepoLabelsFn)
 	s.AddTool(CreateIssueTool, CreateIssueFn)
 	s.AddTool(CreateIssueCommentTool, CreateIssueCommentFn)
 	s.AddTool(UpdateIssueTool, UpdateIssueFn)
@@ -151,6 +163,21 @@ func RegisterTool(s *server.MCPServer) {
 	s.AddTool(GetIssueCommentTool, GetIssueCommentFn)
 	s.AddTool(EditIssueCommentTool, EditIssueCommentFn)
 	s.AddTool(DeleteIssueCommentTool, DeleteIssueCommentFn)
+}
+
+type repoLabelResult struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+}
+
+type listRepoLabelsResult struct {
+	Labels   []repoLabelResult `json:"labels"`
+	Page     int               `json:"page"`
+	Limit    int               `json:"limit"`
+	NextPage int               `json:"next_page"`
+	LastPage int               `json:"last_page"`
 }
 
 func GetIssueByIndexFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -219,6 +246,75 @@ func ListRepoIssuesFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	return to.TextResult(issues)
 }
 
+func ListRepoLabelsFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Debugf("Called ListRepoLabelsFn")
+	args := req.GetArguments()
+	owner, _ := args["owner"].(string)
+	repo, _ := args["repo"].(string)
+
+	page, err := validatedPaginationArgument(args, "page", 1, 1, math.MaxInt)
+	if err != nil {
+		return to.ErrorResult(err)
+	}
+	limit, err := validatedPaginationArgument(args, "limit", 50, 1, 100)
+	if err != nil {
+		return to.ErrorResult(err)
+	}
+
+	labels, response, err := forgejo.Client().ListRepoLabels(owner, repo, forgejo_sdk.ListLabelsOptions{
+		ListOptions: forgejo_sdk.ListOptions{
+			Page:     page,
+			PageSize: limit,
+		},
+	})
+	if err != nil {
+		return to.ErrorResult(fmt.Errorf("list repository labels err: %v", err))
+	}
+
+	result := listRepoLabelsResult{
+		Labels: make([]repoLabelResult, 0, len(labels)),
+		Page:   page,
+		Limit:  limit,
+	}
+	if response != nil {
+		result.NextPage = response.NextPage
+		result.LastPage = response.LastPage
+	}
+	for _, label := range labels {
+		if label == nil {
+			continue
+		}
+		result.Labels = append(result.Labels, repoLabelResult{
+			ID:          label.ID,
+			Name:        label.Name,
+			Color:       label.Color,
+			Description: label.Description,
+		})
+	}
+
+	return to.TextResult(result)
+}
+
+func validatedPaginationArgument(args map[string]any, name string, defaultValue, minValue, maxValue int) (int, error) {
+	raw, ok := args[name]
+	if !ok {
+		return defaultValue, nil
+	}
+
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value {
+		return 0, fmt.Errorf("%s must be an integer", name)
+	}
+	if value < float64(minValue) || value > float64(maxValue) {
+		if maxValue == math.MaxInt {
+			return 0, fmt.Errorf("%s must be greater than or equal to %d", name, minValue)
+		}
+		return 0, fmt.Errorf("%s must be from %d through %d", name, minValue, maxValue)
+	}
+
+	return int(value), nil
+}
+
 func CreateIssueFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	log.Debugf("Called CreateIssueFn")
 	owner, _ := req.GetArguments()["owner"].(string)
@@ -265,7 +361,7 @@ func UpdateIssueFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	milestone, _ := req.GetArguments()["milestone"].(string)
 
 	opt := forgejo_sdk.EditIssueOption{}
-	
+
 	// Only set fields that were provided
 	if title != "" {
 		opt.Title = title
@@ -301,7 +397,7 @@ func AddIssueLabelsFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	// Since we can't directly use label names, we need to fetch the IDs first
 	// This modified approach treats the labels as numeric IDs
 	labelIDs := []int64{}
-	
+
 	for _, labelStr := range strings.Split(labels, ",") {
 		labelStr = strings.TrimSpace(labelStr)
 		labelID, err := strconv.ParseInt(labelStr, 10, 64)
@@ -315,12 +411,12 @@ func AddIssueLabelsFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	opt := forgejo_sdk.IssueLabelsOption{
 		Labels: labelIDs,
 	}
-	
+
 	_, _, err := forgejo.Client().AddIssueLabels(owner, repo, int64(index), opt)
 	if err != nil {
 		return to.ErrorResult(fmt.Errorf("add issue labels err: %v", err))
 	}
-	
+
 	// Fetch the updated issue to return it with the new labels
 	issue, _, err := forgejo.Client().GetIssue(owner, repo, int64(index))
 	if err != nil {
@@ -342,7 +438,7 @@ func IssueStateChangeFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 
 	// Convert string to StateType and create pointer
 	stateType := forgejo_sdk.StateType(state)
-	
+
 	opt := forgejo_sdk.EditIssueOption{
 		State: &stateType,
 	}

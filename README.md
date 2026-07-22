@@ -120,6 +120,7 @@ List all my repositories
 | `list_repo_commits` | List commits in a repository |
 | **Issues** | |
 | `list_repo_issues` | List issues in a repository |
+| `list_repo_labels` | List repository labels and their numeric IDs |
 | `get_issue_by_index` | Get a specific issue |
 | `create_issue` | Create a new issue |
 | `add_issue_labels` | Add labels to an issue |
