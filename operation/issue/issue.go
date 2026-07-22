@@ -22,6 +22,7 @@ const (
 	GetIssueByIndexToolName    = "get_issue_by_index"
 	ListRepoIssuesToolName     = "list_repo_issues"
 	ListRepoLabelsToolName     = "list_repo_labels"
+	ListRepoMilestonesToolName = "list_repo_milestones"
 	CreateIssueToolName        = "create_issue"
 	CreateIssueCommentToolName = "create_issue_comment"
 	UpdateIssueToolName        = "update_issue"
@@ -64,6 +65,16 @@ var (
 		mcp.WithNumber("limit", mcp.Description(params.Limit), mcp.DefaultNumber(50), mcp.Min(1), mcp.Max(100), mcp.MultipleOf(1)),
 	)
 
+	ListRepoMilestonesTool = mcp.NewTool(
+		ListRepoMilestonesToolName,
+		mcp.WithDescription("List milestones available in a repository, including the numeric IDs required to set an issue milestone with update_issue. If next_page is nonzero, call this tool again with that page to enumerate the complete milestone set."),
+		mcp.WithString("owner", mcp.Required(), mcp.Description(params.Owner)),
+		mcp.WithString("repo", mcp.Required(), mcp.Description(params.Repo)),
+		mcp.WithString("state", mcp.Description("Milestone state (open|closed|all)"), mcp.DefaultString("open"), mcp.Enum("open", "closed", "all")),
+		mcp.WithNumber("page", mcp.Description(params.Page), mcp.DefaultNumber(1), mcp.Min(1), mcp.MultipleOf(1)),
+		mcp.WithNumber("limit", mcp.Description(params.Limit), mcp.DefaultNumber(50), mcp.Min(1), mcp.Max(100), mcp.MultipleOf(1)),
+	)
+
 	CreateIssueTool = mcp.NewTool(
 		CreateIssueToolName,
 		mcp.WithDescription("Create issue"),
@@ -91,7 +102,7 @@ var (
 		mcp.WithString("title", mcp.Description(params.Title)),
 		mcp.WithString("body", mcp.Description(params.Body)),
 		mcp.WithString("assignee", mcp.Description("Assignee username")),
-		mcp.WithString("milestone", mcp.Description(params.Milestone)),
+		mcp.WithString("milestone", mcp.Description("Numeric milestone ID to set. Discover IDs with list_repo_milestones first.")),
 	)
 
 	AddIssueLabelsTools = mcp.NewTool(
@@ -154,6 +165,7 @@ func RegisterTool(s *server.MCPServer) {
 	s.AddTool(GetIssueByIndexTool, GetIssueByIndexFn)
 	s.AddTool(ListRepoIssuesTool, ListRepoIssuesFn)
 	s.AddTool(ListRepoLabelsTool, ListRepoLabelsFn)
+	s.AddTool(ListRepoMilestonesTool, ListRepoMilestonesFn)
 	s.AddTool(CreateIssueTool, CreateIssueFn)
 	s.AddTool(CreateIssueCommentTool, CreateIssueCommentFn)
 	s.AddTool(UpdateIssueTool, UpdateIssueFn)
@@ -178,6 +190,24 @@ type listRepoLabelsResult struct {
 	Limit    int               `json:"limit"`
 	NextPage int               `json:"next_page"`
 	LastPage int               `json:"last_page"`
+}
+
+type repoMilestoneResult struct {
+	ID           int64      `json:"id"`
+	Title        string     `json:"title"`
+	Description  string     `json:"description"`
+	State        string     `json:"state"`
+	OpenIssues   int        `json:"open_issues"`
+	ClosedIssues int        `json:"closed_issues"`
+	DueOn        *time.Time `json:"due_on"`
+}
+
+type listRepoMilestonesResult struct {
+	Milestones []repoMilestoneResult `json:"milestones"`
+	Page       int                   `json:"page"`
+	Limit      int                   `json:"limit"`
+	NextPage   int                   `json:"next_page"`
+	LastPage   int                   `json:"last_page"`
 }
 
 func GetIssueByIndexFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -289,6 +319,66 @@ func ListRepoLabelsFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 			Name:        label.Name,
 			Color:       label.Color,
 			Description: label.Description,
+		})
+	}
+
+	return to.TextResult(result)
+}
+
+func ListRepoMilestonesFn(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	log.Debugf("Called ListRepoMilestonesFn")
+	args := req.GetArguments()
+	owner, _ := args["owner"].(string)
+	repo, _ := args["repo"].(string)
+	state, ok := args["state"].(string)
+	if !ok {
+		state = "open"
+	}
+	if state != "open" && state != "closed" && state != "all" {
+		return to.ErrorResult(fmt.Errorf("state must be one of open, closed, or all"))
+	}
+
+	page, err := validatedPaginationArgument(args, "page", 1, 1, math.MaxInt)
+	if err != nil {
+		return to.ErrorResult(err)
+	}
+	limit, err := validatedPaginationArgument(args, "limit", 50, 1, 100)
+	if err != nil {
+		return to.ErrorResult(err)
+	}
+
+	milestones, response, err := forgejo.Client().ListRepoMilestones(owner, repo, forgejo_sdk.ListMilestoneOption{
+		ListOptions: forgejo_sdk.ListOptions{
+			Page:     page,
+			PageSize: limit,
+		},
+		State: forgejo_sdk.StateType(state),
+	})
+	if err != nil {
+		return to.ErrorResult(fmt.Errorf("list repository milestones err: %v", err))
+	}
+
+	result := listRepoMilestonesResult{
+		Milestones: make([]repoMilestoneResult, 0, len(milestones)),
+		Page:       page,
+		Limit:      limit,
+	}
+	if response != nil {
+		result.NextPage = response.NextPage
+		result.LastPage = response.LastPage
+	}
+	for _, milestone := range milestones {
+		if milestone == nil {
+			continue
+		}
+		result.Milestones = append(result.Milestones, repoMilestoneResult{
+			ID:           milestone.ID,
+			Title:        milestone.Title,
+			Description:  milestone.Description,
+			State:        string(milestone.State),
+			OpenIssues:   milestone.OpenIssues,
+			ClosedIssues: milestone.ClosedIssues,
+			DueOn:        milestone.Deadline,
 		})
 	}
 
